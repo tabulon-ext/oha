@@ -1,18 +1,26 @@
 use byte_unit::Byte;
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-use crossterm::ExecutableCommand;
-use flume::TryRecvError;
-use std::collections::BTreeMap;
-use std::io;
-use tui::backend::CrosstermBackend;
-use tui::layout::{Constraint, Direction, Layout};
-use tui::style::{Color, Style};
-use tui::text::{Span, Spans};
-use tui::widgets::{BarChart, Block, Borders, Gauge, Paragraph};
-use tui::Terminal;
+use crossterm::{
+    event::{Event, KeyCode, KeyEvent, KeyModifiers},
+    ExecutableCommand,
+};
+use hyper::http;
+use ratatui::crossterm;
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Style},
+    text::{Line, Span},
+    widgets::{BarChart, Block, Borders, Gauge, Paragraph},
+    Terminal,
+};
+use std::{collections::BTreeMap, io};
 
-use crate::client::{ClientError, RequestResult};
-use crate::timescale::{TimeLabel, TimeScale};
+use crate::{
+    client::{ClientError, RequestResult},
+    printer::PrintConfig,
+    result_data::{MinMaxMean, ResultData},
+    timescale::{TimeLabel, TimeScale},
+};
 
 /// When the monitor ends
 pub enum EndLine {
@@ -22,23 +30,62 @@ pub enum EndLine {
     NumQuery(usize),
 }
 
+struct ColorScheme {
+    light_blue: Option<Color>,
+    green: Option<Color>,
+    yellow: Option<Color>,
+}
+
+impl ColorScheme {
+    fn new() -> ColorScheme {
+        ColorScheme {
+            light_blue: None,
+            green: None,
+            yellow: None,
+        }
+    }
+
+    fn set_colors(&mut self) {
+        self.light_blue = Some(Color::Cyan);
+        self.green = Some(Color::Green);
+        self.yellow = Some(Color::Yellow);
+    }
+}
+
 pub struct Monitor {
+    pub print_config: PrintConfig,
     pub end_line: EndLine,
     /// All workers sends each result to this channel
     pub report_receiver: flume::Receiver<Result<RequestResult, ClientError>>,
     // When started
     pub start: std::time::Instant,
-    // Frame per scond of TUI
+    // Frame per second of TUI
     pub fps: usize,
+    pub disable_color: bool,
 }
 
-impl Monitor {
-    pub async fn monitor(
-        self,
-    ) -> Result<Vec<Result<RequestResult, ClientError>>, crossterm::ErrorKind> {
+struct IntoRawMode;
+
+impl IntoRawMode {
+    pub fn new() -> Result<Self, std::io::Error> {
         crossterm::terminal::enable_raw_mode()?;
         io::stdout().execute(crossterm::terminal::EnterAlternateScreen)?;
         io::stdout().execute(crossterm::cursor::Hide)?;
+        Ok(IntoRawMode)
+    }
+}
+
+impl Drop for IntoRawMode {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = io::stdout().execute(crossterm::terminal::LeaveAlternateScreen);
+        let _ = io::stdout().execute(crossterm::cursor::Show);
+    }
+}
+
+impl Monitor {
+    pub async fn monitor(self) -> Result<(ResultData, PrintConfig), std::io::Error> {
+        let raw_mode = IntoRawMode::new()?;
 
         let mut terminal = {
             let backend = CrosstermBackend::new(io::stdout());
@@ -47,11 +94,9 @@ impl Monitor {
 
         // Return this when ends to application print summary
         // We must not read all data from this due to computational cost.
-        let mut all: Vec<Result<RequestResult, ClientError>> = Vec::new();
-        // statics for HTTP status
+        let mut all: ResultData = Default::default();
+        // stats for HTTP status
         let mut status_dist: BTreeMap<http::StatusCode, usize> = Default::default();
-        // statics for Error
-        let mut error_dist: BTreeMap<String, usize> = Default::default();
 
         #[cfg(unix)]
         // Limit for number open files. eg. ulimit -n
@@ -60,33 +105,32 @@ impl Monitor {
         // None means auto timescale which depends on how long it takes
         let mut timescale_auto = None;
 
-        'outer: loop {
+        let mut colors = ColorScheme::new();
+        if !self.disable_color {
+            colors.set_colors();
+        }
+
+        loop {
             let frame_start = std::time::Instant::now();
-            loop {
-                match self.report_receiver.try_recv() {
-                    Ok(report) => {
-                        match report.as_ref() {
-                            Ok(report) => *status_dist.entry(report.status).or_default() += 1,
-                            Err(e) => *error_dist.entry(e.to_string()).or_default() += 1,
-                        }
-                        all.push(report);
-                    }
-                    Err(TryRecvError::Empty) => {
-                        break;
-                    }
-                    Err(TryRecvError::Disconnected) => {
-                        // Application ends.
-                        break 'outer;
-                    }
+            let is_disconnected = self.report_receiver.is_disconnected();
+
+            for report in self.report_receiver.drain() {
+                if let Ok(report) = report.as_ref() {
+                    *status_dist.entry(report.status).or_default() += 1;
                 }
+                all.push(report);
+            }
+
+            if is_disconnected {
+                break;
             }
 
             let now = std::time::Instant::now();
             let progress = match &self.end_line {
-                EndLine::Duration(d) => ((now - self.start).as_secs_f64() / d.as_secs_f64())
-                    .max(0.0)
-                    .min(1.0),
-                EndLine::NumQuery(n) => (all.len() as f64 / *n as f64).max(0.0).min(1.0),
+                EndLine::Duration(d) => {
+                    ((now - self.start).as_secs_f64() / d.as_secs_f64()).clamp(0.0, 1.0)
+                }
+                EndLine::NumQuery(n) => (all.len() as f64 / *n as f64).clamp(0.0, 1.0),
             };
 
             let count = 32;
@@ -101,19 +145,17 @@ impl Monitor {
 
             let mut bar_num_req = vec![0u64; count];
             let short_bin = (now - self.start).as_secs_f64() % bin;
-            for r in all.iter().rev() {
-                if let Ok(r) = r.as_ref() {
-                    let past = (now - r.end).as_secs_f64();
-                    let i = if past <= short_bin {
-                        0
-                    } else {
-                        1 + ((past - short_bin) / bin) as usize
-                    };
-                    if i >= bar_num_req.len() {
-                        break;
-                    }
-                    bar_num_req[i] += 1;
+            for r in all.success().iter().rev() {
+                let past = (now - r.end).as_secs_f64();
+                let i = if past <= short_bin {
+                    0
+                } else {
+                    1 + ((past - short_bin) / bin) as usize
+                };
+                if i >= bar_num_req.len() {
+                    break;
                 }
+                bar_num_req[i] += 1;
             }
 
             let cols = bar_num_req
@@ -145,19 +187,7 @@ impl Monitor {
                 bar_num_req.iter().map(|(a, b)| (a.as_str(), *b)).collect();
 
             #[cfg(unix)]
-            let nofile = match tokio::fs::read_dir("/dev/fd").await {
-                Ok(mut dir) => {
-                    let mut count = 0;
-                    loop {
-                        match dir.next_entry().await {
-                            Ok(Some(_)) => count += 1,
-                            Ok(None) => break Ok(count),
-                            Err(err) => break Err(err),
-                        }
-                    }
-                }
-                Err(e) => Err(e),
-            };
+            let nofile = std::fs::read_dir("/dev/fd").map(|dir| dir.count());
 
             terminal.draw(|f| {
                 let row4 = Layout::default()
@@ -166,12 +196,12 @@ impl Monitor {
                         [
                             Constraint::Length(3),
                             Constraint::Length(8),
-                            Constraint::Length(error_dist.len() as u16 + 2),
-                            Constraint::Percentage(40),
+                            Constraint::Length(all.error_distribution().len() as u16 + 2),
+                            Constraint::Fill(1),
                         ]
                         .as_ref(),
                     )
-                    .split(f.size());
+                    .split(f.area());
 
                 let mid = Layout::default()
                     .direction(Direction::Horizontal)
@@ -195,60 +225,60 @@ impl Monitor {
                 };
                 let gauge = Gauge::default()
                     .block(Block::default().title("Progress").borders(Borders::ALL))
-                    .gauge_style(Style::default().fg(Color::White))
+                    .gauge_style(Style::default().fg(colors.light_blue.unwrap_or(Color::White)))
                     .label(Span::raw(gauge_label))
                     .ratio(progress);
                 f.render_widget(gauge, row4[0]);
 
-                let last_1_timescale = all
-                    .iter()
-                    .rev()
-                    .filter_map(|r| r.as_ref().ok())
-                    .take_while(|r| (now - r.end).as_secs_f64() <= timescale.as_secs_f64())
-                    .collect::<Vec<_>>();
-
-                let statics_text = vec![
-                    Spans::from(format!("Requests : {}", last_1_timescale.len())),
-                    Spans::from(format!(
-                        "Slowest: {:.4} secs",
-                        last_1_timescale
-                            .iter()
-                            .map(|r| r.duration())
-                            .max()
-                            .map(|d| d.as_secs_f64())
-                            .unwrap_or(std::f64::NAN)
-                    )),
-                    Spans::from(format!(
-                        "Fastest: {:.4} secs",
-                        last_1_timescale
-                            .iter()
-                            .map(|r| r.duration())
-                            .min()
-                            .map(|d| d.as_secs_f64())
-                            .unwrap_or(std::f64::NAN)
-                    )),
-                    Spans::from(format!(
-                        "Average: {:.4} secs",
-                        last_1_timescale
-                            .iter()
-                            .map(|r| r.duration())
-                            .sum::<std::time::Duration>()
+                let last_1_timescale = {
+                    let success = all.success();
+                    let index = match success.binary_search_by(|probe| {
+                        (now - probe.end)
                             .as_secs_f64()
-                            / last_1_timescale.len() as f64
-                    )),
-                    Spans::from(format!(
-                        "Data: {}",
-                        Byte::from_bytes(
+                            .partial_cmp(&timescale.as_secs_f64())
+                            // Should be fine
+                            .unwrap()
+                            .reverse()
+                    }) {
+                        Ok(i) => i,
+                        Err(i) => i,
+                    };
+
+                    &success[index..]
+                };
+
+                let last_1_minmaxmean: MinMaxMean = last_1_timescale
+                    .iter()
+                    .map(|r| r.duration().as_secs_f64())
+                    .collect();
+
+                let stats_text = vec![
+                    Line::from(format!("Requests : {}", last_1_timescale.len())),
+                    Line::from(vec![Span::styled(
+                        format!("Slowest: {:.4} secs", last_1_minmaxmean.max(),),
+                        Style::default().fg(colors.yellow.unwrap_or(Color::Reset)),
+                    )]),
+                    Line::from(vec![Span::styled(
+                        format!("Fastest: {:.4} secs", last_1_minmaxmean.min(),),
+                        Style::default().fg(colors.green.unwrap_or(Color::Reset)),
+                    )]),
+                    Line::from(vec![Span::styled(
+                        format!("Average: {:.4} secs", last_1_minmaxmean.mean(),),
+                        Style::default().fg(colors.light_blue.unwrap_or(Color::Reset)),
+                    )]),
+                    Line::from(format!(
+                        "Data: {:.2}",
+                        Byte::from_u64(
                             last_1_timescale
                                 .iter()
-                                .map(|r| r.len_bytes as u128)
-                                .sum::<u128>()
+                                .map(|r| r.len_bytes as u64)
+                                .sum::<u64>()
                         )
-                        .get_appropriate_unit(true)
+                        .get_appropriate_unit(byte_unit::UnitType::Binary)
                     )),
                     #[cfg(unix)]
                     // Note: Windows can open 255 * 255 * 255 files. So not showing on windows is OK.
-                    Spans::from(format!(
+                    Line::from(format!(
                         "Number of open files: {} / {}",
                         nofile
                             .map(|c| c.to_string())
@@ -259,36 +289,37 @@ impl Monitor {
                             .unwrap_or_else(|_| "Unknown".to_string())
                     )),
                 ];
-                let statics_title = format!("statics for last {}", timescale);
-                let statics = Paragraph::new(statics_text).block(
+                let stats_title = format!("stats for last {timescale}");
+                let stats = Paragraph::new(stats_text).block(
                     Block::default()
-                        .title(Span::raw(statics_title))
+                        .title(Span::raw(stats_title))
                         .borders(Borders::ALL),
                 );
-                f.render_widget(statics, mid[0]);
+                f.render_widget(stats, mid[0]);
 
                 let mut status_v: Vec<(http::StatusCode, usize)> =
                     status_dist.clone().into_iter().collect();
                 status_v.sort_by_key(|t| std::cmp::Reverse(t.1));
 
-                let statics2_text = status_v
+                let stats2_text = status_v
                     .into_iter()
                     .map(|(status, count)| {
-                        Spans::from(format!("[{}] {} responses", status.as_str(), count))
+                        Line::from(format!("[{}] {} responses", status.as_str(), count))
                     })
                     .collect::<Vec<_>>();
-                let statics2 = Paragraph::new(statics2_text).block(
+                let stats2 = Paragraph::new(stats2_text).block(
                     Block::default()
                         .title("Status code distribution")
                         .borders(Borders::ALL),
                 );
-                f.render_widget(statics2, mid[1]);
+                f.render_widget(stats2, mid[1]);
 
-                let mut error_v: Vec<(String, usize)> = error_dist.clone().into_iter().collect();
+                let mut error_v: Vec<(String, usize)> =
+                    all.error_distribution().clone().into_iter().collect();
                 error_v.sort_by_key(|t| std::cmp::Reverse(t.1));
                 let errors_text = error_v
                     .into_iter()
-                    .map(|(e, count)| Spans::from(format!("[{}] {}", count, e)))
+                    .map(|(e, count)| Line::from(format!("[{count}] {e}")))
                     .collect::<Vec<_>>();
                 let errors = Paragraph::new(errors_text).block(
                     Block::default()
@@ -311,6 +342,11 @@ impl Monitor {
                     .block(
                         Block::default()
                             .title(Span::raw(title))
+                            .style(
+                                Style::default()
+                                    .fg(colors.green.unwrap_or(Color::Reset))
+                                    .bg(Color::Reset),
+                            )
                             .borders(Borders::ALL),
                     )
                     .data(bar_num_req_str.as_slice())
@@ -330,19 +366,17 @@ impl Monitor {
                         0
                     } else {
                         (bottom[1].width as usize - 2) / (resp_histo_width + 1)
-                    };
-                    let values = all
+                    }
+                    .max(2);
+                    let values = last_1_timescale
                         .iter()
-                        .rev()
-                        .filter_map(|r| r.as_ref().ok())
-                        .take_while(|r| (now - r.end).as_secs_f64() < timescale.as_secs_f64())
                         .map(|r| r.duration().as_secs_f64())
                         .collect::<Vec<_>>();
 
                     let histo = crate::histogram::histogram(&values, bins);
                     histo
                         .into_iter()
-                        .map(|(label, v)| (format!("{:.4}", label), v as u64))
+                        .map(|(label, v)| (format!("{label:.4}"), v as u64))
                         .collect()
                 };
 
@@ -355,6 +389,11 @@ impl Monitor {
                     .block(
                         Block::default()
                             .title("Response time histogram")
+                            .style(
+                                Style::default()
+                                    .fg(colors.yellow.unwrap_or(Color::Reset))
+                                    .bg(Color::Reset),
+                            )
                             .borders(Borders::ALL),
                     )
                     .data(resp_histo_data_str.as_slice())
@@ -390,12 +429,12 @@ impl Monitor {
                     | Event::Key(KeyEvent {
                         code: KeyCode::Char('c'),
                         modifiers: KeyModifiers::CONTROL,
+                        ..
                     }) => {
-                        std::io::stdout().execute(crossterm::terminal::LeaveAlternateScreen)?;
-                        crossterm::terminal::disable_raw_mode()?;
-                        std::io::stdout().execute(crossterm::cursor::Show)?;
-                        let _ = crate::printer::print_summary(
-                            &mut std::io::stdout(),
+                        drop(raw_mode);
+                        let _ = crate::printer::print_result(
+                            self.print_config,
+                            self.start,
                             &all,
                             now - self.start,
                         );
@@ -411,10 +450,6 @@ impl Monitor {
                 tokio::time::sleep(per_frame - elapsed).await;
             }
         }
-
-        std::io::stdout().execute(crossterm::terminal::LeaveAlternateScreen)?;
-        crossterm::terminal::disable_raw_mode()?;
-        std::io::stdout().execute(crossterm::cursor::Show)?;
-        Ok(all)
+        Ok((all, self.print_config))
     }
 }
